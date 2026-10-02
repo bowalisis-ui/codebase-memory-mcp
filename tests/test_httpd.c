@@ -33,6 +33,9 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
@@ -1169,19 +1172,26 @@ TEST(ui_server_mutations_require_json_content_type) {
 TEST(ui_server_rpc_allows_only_ui_read_tools) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
-    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
-                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
     char req[1024];
-    snprintf(req, sizeof(req),
-             "POST /rpc HTTP/1.1\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %d\r\n\r\n%s",
-             (int)strlen(body), body);
     char resp[8192];
-    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
-    ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 200);
-    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    int n = 0;
+    static const char *allowed_tools[] = {"list_projects", "get_graph_schema", "get_code_snippet"};
+    for (size_t i = 0; i < sizeof(allowed_tools) / sizeof(allowed_tools[0]); i++) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"%s\",\"arguments\":{}}}",
+                 allowed_tools[i]);
+        snprintf(req, sizeof(req),
+                 "POST /rpc HTTP/1.1\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 strlen(body), body);
+        n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 200);
+        ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    }
 
     static const char *blocked_tools[] = {"delete_project", "manage_adr", "ingest_traces",
                                           "index_repository"};
@@ -1568,6 +1578,23 @@ TEST(ui_server_ui_config_detects_zh_accept_language) {
     ASSERT_TRUE(n > 0);
     ASSERT_EQ(th_status(resp), 200);
     ASSERT_NOT_NULL(strstr(resp, "\"lang\":\"zh\""));
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_ui_config_includes_serving_version_issue1820) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/ui-config HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    char expected_version[128];
+    snprintf(expected_version, sizeof(expected_version), "\"version\":\"%s\"", CBM_VERSION);
+    ASSERT_NOT_NULL(strstr(resp, expected_version));
 
     th_server_stop(&ts);
     PASS();
@@ -2123,6 +2150,59 @@ TEST(ui_server_rejects_non_loopback_host) {
     PASS();
 }
 
+/* The browser sends UTF-8 repository paths in a percent-encoded query. On
+ * Windows, the handler's narrow opendir/readdir calls accepted the ASCII parent
+ * but could neither list nor open a non-ASCII child, even though cbm_is_dir's
+ * wide-path check had already accepted it. Exercise both user-visible steps:
+ * discover the Unicode directory from its parent, then browse into it. */
+TEST(ui_server_browse_non_ascii_directory) {
+    static const char utf8_name[] = "\xE9\x81\x93\xE5\x85\xB7\xE7\xAE\xB1"; /* toolbox */
+    char *created = th_mktempdir("cbm_browse_utf8");
+    if (!created)
+        FAIL("mktempdir");
+
+    char base[512];
+    snprintf(base, sizeof(base), "%s", created);
+    cbm_normalize_path_sep(base);
+
+    char unicode_dir[768];
+    char child[1024];
+    int unicode_len = snprintf(unicode_dir, sizeof(unicode_dir), "%s/%s", base, utf8_name);
+    int child_len = snprintf(child, sizeof(child), "%s/Percy", unicode_dir);
+    if (unicode_len <= 0 || (size_t)unicode_len >= sizeof(unicode_dir) || child_len <= 0 ||
+        (size_t)child_len >= sizeof(child) || th_mkdir_p(child) != 0) {
+        th_cleanup(base);
+        FAIL("failed to create non-ASCII browse fixture");
+    }
+
+    th_server_t ts;
+    if (th_server_start(&ts) != 0) {
+        th_cleanup(base);
+        FAIL("server start");
+    }
+
+    int port = cbm_http_server_port(ts.srv);
+    char request[1536];
+    char response[8192];
+    snprintf(request, sizeof(request),
+             "GET /api/browse?path=%s/%%E9%%81%%93%%E5%%85%%B7%%E7%%AE%%B1 HTTP/1.1\r\n\r\n", base);
+    int n = th_http(port, request, response, sizeof(response));
+    bool child_browse_ok =
+        n > 0 && th_status(response) == 200 && strstr(response, "\"Percy\"") != NULL;
+
+    snprintf(request, sizeof(request), "GET /api/browse?path=%s HTTP/1.1\r\n\r\n", base);
+    n = th_http(port, request, response, sizeof(response));
+    bool parent_lists_unicode =
+        n > 0 && th_status(response) == 200 && strstr(response, utf8_name) != NULL;
+
+    th_server_stop(&ts);
+    th_cleanup(base);
+
+    ASSERT_TRUE(parent_lists_unicode);
+    ASSERT_TRUE(child_browse_ok);
+    PASS();
+}
+
 /* The directory browser formats readdir() entries into a fixed 32 KB response
  * buffer. The per-entry loop is clamped, but the trailing "parent"/"roots"
  * appends were not — once the entries filled the buffer, pos ran past the end
@@ -2340,6 +2420,7 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
+    RUN_TEST(ui_server_browse_non_ascii_directory);
     RUN_TEST(ui_server_browse_wide_dir_no_overflow);
     RUN_TEST(ui_server_logs_escape_dense_no_overflow);
     RUN_TEST(ui_server_index_status_long_paths_no_overflow);
@@ -2397,6 +2478,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_delete_project_invalid_name_keeps_watch);
     RUN_TEST(ui_server_delete_project_unlink_failure_keeps_watch);
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
+    RUN_TEST(ui_server_ui_config_includes_serving_version_issue1820);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);
     RUN_TEST(ui_server_access_log_redacts_query);

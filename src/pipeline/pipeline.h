@@ -53,6 +53,20 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
+
+/* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
+ * when the run succeeded / did not reach post-publish export. Used to
+ * truthfully attribute a failed run to the persistence export (#1665) instead
+ * of the generic pipeline-error hint. Valid until the next cbm_pipeline_run or
+ * cbm_pipeline_free(). Returns "" for NULL p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -63,9 +77,16 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * need to know whether the PREVIOUS generation survived can distinguish the
  * failures by value: the run publishes by renaming a fully validated staging
  * database over the destination, so every abort before that rename leaves the
- * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
- * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
- * stages that raise them. */
+ * existing database in place. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2) /* aborted pre-publication; previous DB intact */
+#define CBM_PIPELINE_PERSIST_FAILED (-4)    /* staging/rollback failure during publication */
+/* Resident memory stayed above the budget after back-pressure and one
+ * confirmation cycle: the run stops before publication, no partial graph is
+ * written, the previous DB is intact (#1997 #832). Distinct from the cancel
+ * sentinel so callers can name the cause instead of "pipeline failed". */
+#define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
+/* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
+#define CBM_PIPELINE_RESOURCE_LIMIT (-6)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
@@ -192,6 +213,13 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
  * Caller must free() the returned string. */
 char *cbm_project_name_from_path(const char *abs_path);
 
+/* The name-mapping half of cbm_project_name_from_path, WITHOUT path
+ * canonicalization: maps any string to the stored project-name form (unsafe
+ * ASCII -> '-', non-ASCII bytes -> two hex digits, dash/dot collapse, trim,
+ * #624 length cap). Lets a selector such as a bare non-ASCII folder name be
+ * encoded exactly like the segment it came from (#1827). Caller frees. */
+char *cbm_project_name_sanitize(const char *name_path);
+
 /* ── Function Registry ──────────────────────────────────────────── */
 
 typedef struct cbm_registry cbm_registry_t;
@@ -280,6 +308,42 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
+/* True if `name` is a method of a Python builtin type (str/bytes/list/dict/set/
+ * file) or a builtin function seen as an attribute call. A language fact, kept
+ * as a sorted table like the Perl builtins. */
+bool cbm_python_is_builtin_member(const char *name);
+
+/* The member guard's exemption: a Python member call whose receiver is an
+ * attribute chain rooted at self/cls (an object the class owns), whose callee has
+ * exactly one project definition (strategy unique_name) and is not a builtin
+ * type's own method keeps its edge. Combine at the call sites as
+ * `suppress && !exempt`; both pass_calls.c and pass_parallel.c must do the same.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy);
+
+/* Bare-call counterpart of the guard above. True when a resolved BARE call edge
+ * binds a callee that is shadowed by an enclosing parameter, and the match came
+ * from a weak short-name strategy — so the edge is fabricated by construction
+ * (`def f(run): run()` must not bind an unrelated `SatoriLive.run`). Shares the
+ * member guard's drop-list, so lsp_* / import / same-module matches are kept.
+ * Deliberately keyed on the SCOPE FACT, not on the callee's spelling. The
+ * language set lives at the call sites (pass_calls.c / pass_parallel.c) and must
+ * be identical in both, or the sequential and parallel resolvers diverge.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
+                                          const char *strategy);
+
+/* Import-binding counterpart (#2127). True when the callee's root identifier
+ * is bound by an import of this file whose module chain contradicts the
+ * resolved target (`from unittest.mock import patch; patch()` must not bind a
+ * project `PkgConfigView.patch`), and the match came from a weak short-name
+ * strategy. Same drop-list as the guards above; the language set lives at the
+ * call sites and must be identical in pass_calls.c and pass_parallel.c.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
+                                         const char *strategy);
+
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
  * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX
@@ -287,6 +351,22 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
+
+/* #1928: USAGE/WRITES/READS analog of the CALLS guard above. Reference edges
+ * resolved by the short-name registry carry no import-closure evidence, so a
+ * cross-language binding is a bare-name collision for EVERY strategy — drop
+ * it whenever the caller's language and the target file's language disagree
+ * (JS/TS family members and the C/C++ header family excepted). Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
+
+/* #1942: a bare (dot-less) Go reference can never denote a struct field —
+ * field access is always a selector expression, and selector references
+ * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a
+ * Field when the reference text carries no '.'. Go only: other OO languages
+ * legitimately reference their own members bare inside method bodies. Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

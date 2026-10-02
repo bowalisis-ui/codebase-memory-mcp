@@ -23,18 +23,21 @@
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
+ * (5 s). Passed as cbm_extract_file*()'s timeout_micros; a generous wall-clock
+ * ceiling (CBM_PARSE_WALL_CEILING_FACTOR x, ~60 s) backstops a stuck parse.
+ * It is a time budget, not a byte budget. */
 #define CBM_EXTRACT_BUDGET 5000000
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
-/* Incremental integrity failure: abort the run and preserve the existing DB.
- * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
+/* CBM_PIPELINE_ABORT_PRESERVE_DB / CBM_PIPELINE_PERSIST_FAILED moved to
+ * pipeline.h — callers legitimately distinguish them (the header's contract
+ * always said so). FORCE_FULL_REINDEX never escapes the orchestrator and
+ * stays internal. All three are distinct from CBM_NOT_FOUND, the normal
  * "no incremental route; continue with a full index" sentinel. */
-#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
-#define CBM_PIPELINE_PERSIST_FAILED (-4)
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
@@ -136,7 +139,40 @@ typedef struct {
     /* ObjectScript method-return-type table built from extracted definitions
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
+
+    /* Spill / admission control (2026-09-13). spill_mode latches on the first
+     * over-budget observation in the extract gate (or on CBM_MEM_SPILL=1):
+     * from then on every compacted result is parked on disk instead of held
+     * in the cache, results already cached are swept out, and every later
+     * consumer (registry build, def collection, resolve) loads a result only
+     * for the moment it reads it. Memory then sits at the floor -- graph +
+     * registries + in-flight files -- and the run pays with disk reads.
+     * NULL/0 = results stay in memory as always. Owned by pipeline.c. */
+    struct cbm_result_spill *spill;
+    _Atomic int spill_mode;
+    /* Set by the ONE owner whose every result-cache consumer goes through
+     * cbm_pipeline_result_acquire()/release() and that closes the store
+     * (run_parallel_pipeline). An owner that leaves it false never spills:
+     * the incremental and probe routes still hand the cache array to passes
+     * that index it directly, so they keep results in memory (follow-up). */
+    bool spill_allowed;
 } cbm_pipeline_ctx_t;
+
+/* ── Result-cache access contract (spill mode) ────────────────────────
+ * After extraction a slot of the result cache is either the in-memory result
+ * or NULL with the result parked on disk (ctx->spill). Every consumer reads a
+ * slot through this pair; a pass that indexes the array itself is blind to
+ * parked results (the infra-route passes lost every __route__infra__ node
+ * that way, 2026-09-13). `want` (NULL = always) sees the parked HEADER first
+ * -- counts are valid, pointers are not -- and can veto the load, so a pass
+ * after one rare list does not read every parked result back from disk. */
+typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
+CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                           int i, cbm_result_want_fn want, bool *loaded);
+void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
+
+/* Log the store counters, close and delete the store, drop the latch. */
+void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
@@ -178,6 +214,21 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path);
 
+/* #1916: HTTP client-instance calls. When `call` is `<recv>.<verb>(url)` with
+ * an HTTP verb suffix and a path/URL first argument, and `recv` is bound —
+ * in the calling module itself, or via an ES import (named or default) — to a
+ * binding the extractor marked as an `axios.create(...)` instance
+ * (`http_client` node property), write the request URL to `out` (the
+ * instance's literal `http_base_url` joined with a '/'-leading path, the path
+ * unchanged when the base is unknown or the URL is absolute) and return true.
+ * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
+ * route-registration or registry fallback, so a wrapper client's `api.get`
+ * is never mistaken for an Express `app.get` route registration. */
+bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                       const CBMFileResult *result, const char **imp_keys,
+                                       const char **imp_vals, int imp_count, const CBMCall *call,
+                                       char *out, size_t out_sz);
+
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
  * Resolution order (first hit wins):
@@ -205,6 +256,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                                                CBMFileResult *const *results,
                                                const char *const *rels, int count);
+/* The same map built from the namespace names directly. The parallel pass needs
+ * this: results it has spilled are NULL in its cache, and a file missing from
+ * the map does not fail to resolve -- it resolves through the looser fallback,
+ * so an incomplete map CHANGES the graph instead of shrinking it. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
@@ -233,6 +291,31 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
 }
 
 /* ── Testable helpers ────────────────────────────────────────────── */
+
+/* #1934: whether the import resolver's name-guess fallbacks — Strategy 1b
+ * (sibling file; its label filter admits symbols) and Strategy 3 (symbol
+ * name) — may run for imports from this language. False for Go: an import
+ * path names a package, never a symbol, so a Strategy-1 miss means the import
+ * is external and the correct result is no edge. Pure; exercised through
+ * ei_go_import_never_binds_symbol. */
+bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
+
+/* #2127: true when the module segments preceding `name` in a Python import
+ * path (`unittest.mock.patch` -> unittest, mock) occur, in order, among the
+ * enclosing segments of `hit_qn`. Leading relative dots and ` as alias` are
+ * ignored; a path with no module chain before `name` always matches. Gates
+ * the import resolver's symbol-name fallback for Python. */
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn);
+
+/* #2127: true when the callee's root identifier is bound by the file's Python
+ * imports and every such binding is EXTERNAL (no IMPORTS edge from `rel_path`
+ * in `gbuf` carries its local name; NULL gbuf = none) with a module chain that
+ * contradicts `resolved_qn`. Feeds cbm_suppress_weak_import_bound_call at both
+ * resolver call sites. */
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path);
 
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
@@ -617,6 +700,9 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
+int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
+
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 
@@ -733,7 +819,7 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
                                            const cbm_file_hash_t *right, int right_count);
 /* Re-run discovery and hash its exact semantic inputs. Used at the publication
  * boundary so late additions/deletions cannot escape a frozen file list. */
-int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
@@ -784,6 +870,17 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
  * executor; the dump path uses it internally). malloc'd, caller frees. */
 char *cbm_pipeline_create_staging_path(const char *final_path);
 
+/* Stage ownership (#1839). Every stage minted by cbm_pipeline_create_staging_path
+ * is owned through an exclusive kernel lock on the sidecar "<stage>.lock" for
+ * as long as the stage exists; the lock -- and the sidecar -- go away when the
+ * stage is discarded or renamed into place, and the kernel drops the lock
+ * when the writer dies. Hold/drop are the same primitive, exposed so a test
+ * can stand in for a live writer. hold returns a descriptor >= 0, or -1 when
+ * another holder is live or the sidecar cannot be created. drop releases the
+ * lock and unlinks the sidecar. */
+int cbm_pipeline_stage_lock_hold(const char *stage_path);
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd);
+
 /* ── Delta-repair staging primitives (pipeline_delta.c) ──────────
  * Closure-route-only subsystem: clone the live generation, patch exactly
  * the repaired node/edge set, publish through the shared finalize leg. */
@@ -815,6 +912,8 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
@@ -856,6 +955,12 @@ void cbm_pp_bp_nap_cycles_reset(void);
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
 
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test-only view of the Studio Export range join, so the ",+<N>" truncation
+ * marker rules can be checked without building a 256-region export file. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part);
+#endif
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Deterministic test-only operation count for the shared semantic-reference
  * matcher used by both sequential and fused-parallel usage materialization. */
@@ -883,6 +988,15 @@ void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);
+/* Fires from create_staging_path(), right after the stage's main file is
+ * created with O_EXCL. In the current lock-before-visible ordering its sidecar
+ * lock is already held at this point, so a test hook installed here can run a
+ * concurrent sweep (via another cbm_pipeline_run() against the same
+ * final_path) and confirm the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked window, so the hook also
+ * binds RED if that ordering regresses. */
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata);
 cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
 void cbm_pipeline_incremental_test_reset_faults(void);
 
@@ -892,6 +1006,7 @@ bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_predump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_destination_prepare(void);
 void cbm_pipeline_persist_test_run_before_final_manifest(void);
+void cbm_pipeline_persist_test_run_after_stage_created(void);
 void cbm_pipeline_persist_test_reset_faults(void);
 #endif
 

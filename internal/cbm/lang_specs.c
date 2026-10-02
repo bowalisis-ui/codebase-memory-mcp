@@ -594,8 +594,9 @@ static const char *swift_decorator_types[] = {"attribute", NULL};
 // ==================== DART ====================
 static const char *dart_func_types[] = {"function_signature", "method_signature",
                                         "lambda_expression", NULL};
-static const char *dart_class_types[] = {"class_definition", "enum_declaration",
-                                         "mixin_declaration", "type_alias", NULL};
+static const char *dart_class_types[] = {"class_definition",  "enum_declaration",
+                                         "mixin_declaration", "extension_declaration",
+                                         "type_alias",        NULL};
 static const char *dart_field_types[] = {"declaration", NULL};
 static const char *dart_module_types[] = {"program", NULL};
 static const char *dart_call_types[] = {"selector", "new_expression", NULL};
@@ -890,8 +891,9 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // ==================== Embedded sub-languages ====================
 // Host grammars (Svelte/Vue/HTML/Astro) treat <script> bodies as raw_text and
 // do not recurse into them. Declaring the host's script-content node here lets
-// the generic embedded-imports walker re-parse that slice with the JS grammar
-// so the existing ES import extractor sees real import_statement nodes.
+// the generic embedded walker re-parse that slice with the declared grammar so
+// its definitions, imports and calls extract in host-file coordinates. The
+// declared language is the default; a <script lang=> attribute overrides it.
 // Terminator: an entry whose script_node_type is NULL.
 static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
     /* Tag-dialect CFML keeps <cfscript> bodies as opaque cf_script_content;
@@ -915,10 +917,12 @@ static const CBMEmbeddedLangSpec html_embedded_imports[] = {
 };
 static const CBMEmbeddedLangSpec astro_embedded_imports[] = {
     /* Astro component scripts live in the `---` frontmatter fence, which the
-     * grammar keeps as an unparsed frontmatter_js_block. Re-parse that slice
-     * with the JS grammar so `import X from './X.astro'` becomes a real edge. */
-    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT},
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
+     * grammar keeps as an unparsed frontmatter_js_block. Astro type-checks the
+     * fence and its <script> bodies as TypeScript without any lang= attribute
+     * saying so (the fence cannot carry one), so TypeScript is the deliberate
+     * default for both; it parses untyped JavaScript unchanged. */
+    {"frontmatter", "frontmatter_js_block", CBM_LANG_TYPESCRIPT},
+    {"script_element", "raw_text", CBM_LANG_TYPESCRIPT},
     {NULL, NULL, 0},
 };
 
@@ -1594,11 +1598,21 @@ static const char *tlaplus_branch_types[] = {"if_then_else", "case", NULL};
 static const char *tlaplus_var_types[] = {"variable_declaration", NULL};
 static const char *tlaplus_module_types[] = {"source_file", NULL};
 static const char *pkl_func_types[] = {"classMethod", "objectMethod", NULL};
-static const char *pkl_class_types[] = {"clazz", NULL};
-static const char *pkl_import_types[] = {"importClause", "extendsOrAmendsClause", "extends",
-                                         "import", NULL};
+static const char *pkl_class_types[] = {"clazz", "typeAlias", NULL};
+static const char *pkl_import_types[] = {
+    "importClause", "importGlobClause", "importExpr", "extendsOrAmendsClause",
+    "extends",      "import",           NULL};
 static const char *pkl_var_types[] = {"classProperty", "objectProperty", NULL};
 static const char *pkl_module_types[] = {"module", NULL};
+/* Both access exprs double as plain property reads; extract_pkl_callee keeps
+ * only the ones carrying an argumentList. `newExpr` resolves to its type. */
+static const char *pkl_call_types[] = {"unqualifiedAccessExpr", "qualifiedAccessExpr", "newExpr",
+                                       NULL};
+/* Control-flow only, matching every other spec (short-circuit operators are
+ * deliberately excluded). `forGenerator` is also a loop — see helpers.c. */
+static const char *pkl_branch_types[] = {"ifExpr", "whenGenerator", "forGenerator", NULL};
+static const char *pkl_throw_types[] = {"throwExpr", NULL};
+static const char *pkl_decorator_types[] = {"annotation", NULL};
 static const char *gomod_var_types[] = {"require_directive", "replace_directive", NULL};
 static const char *gomod_import_types[] = {"require", NULL};
 static const char *gomod_module_types[] = {"source_file", NULL};
@@ -2630,9 +2644,9 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_PKL
     [CBM_LANG_PKL] = {CBM_LANG_PKL, pkl_func_types, pkl_class_types, empty_types, pkl_module_types,
-                      empty_types, pkl_import_types, empty_types, empty_types, pkl_var_types,
-                      empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_pkl,
-                      NULL},
+                      pkl_call_types, pkl_import_types, empty_types, pkl_branch_types,
+                      pkl_var_types, empty_types, pkl_throw_types, NULL, pkl_decorator_types, NULL,
+                      NULL, tree_sitter_pkl, NULL},
 
     // CBM_LANG_GOMOD
     [CBM_LANG_GOMOD] = {CBM_LANG_GOMOD, empty_types, empty_types, empty_types, gomod_module_types,

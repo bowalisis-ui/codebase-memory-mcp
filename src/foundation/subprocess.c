@@ -7,6 +7,7 @@
 
 #include "compat.h" /* cbm_nanosleep */
 #include "compat_fs.h"
+#include "git_env.h" /* strip_git_repo_env: scrubbed child environment for git */
 #include "log.h"
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
@@ -27,8 +28,8 @@
 #include <signal.h>
 #ifdef __APPLE__
 #include <spawn.h>
-extern char **environ;
 #endif
+extern char **environ;
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -411,7 +412,12 @@ struct cbm_subprocess {
     void *log_ud;
     int quiet_timeout_ms;
     int cancel_grace_ms;
+    size_t memory_limit_bytes;
     bool delete_log_on_exit;
+    bool strip_git_repo_env;
+#ifndef _WIN32
+    char **envp; /* NULL => inherit environ; else the scrubbed git child env */
+#endif
 
     long tail_pos;
     uint64_t last_activity_ms;
@@ -444,6 +450,9 @@ static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->forced = false;
     result->tree_quiesced = false;
     result->supervision_failed = false;
+    result->job_memory_limit_bytes = 0;
+    result->peak_job_memory_bytes = 0;
+    result->job_memory_available = false;
 }
 
 static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
@@ -459,6 +468,9 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
     free(process->bin);
     free(process->windows_cmd_payload);
     free(process->log_file);
+#ifndef _WIN32
+    cbm_git_child_env_free(process->envp);
+#endif
     free(process);
 }
 
@@ -525,7 +537,20 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     if (process->cancel_grace_ms > CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS) {
         process->cancel_grace_ms = CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS;
     }
+    process->memory_limit_bytes = opts->memory_limit_bytes;
     process->delete_log_on_exit = opts->delete_log_on_exit;
+    process->strip_git_repo_env = opts->strip_git_repo_env;
+#ifndef _WIN32
+    /* Built before the spawn: the fork child may only assign it (malloc is
+     * not async-signal-safe there). Fail closed rather than inherit GIT_DIR. */
+    if (opts->strip_git_repo_env) {
+        process->envp = cbm_git_child_envp();
+        if (!process->envp) {
+            cbm_subprocess_free_config(process);
+            return NULL;
+        }
+    }
+#endif
     atomic_init(&process->lifecycle, CBM_SUBPROCESS_ACTIVE);
     cbm_subprocess_result_init(&process->result);
     return process;
@@ -658,6 +683,10 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     ZeroMemory(&limits, sizeof(limits));
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (process->memory_limit_bytes > 0) {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.JobMemoryLimit = (SIZE_T)process->memory_limit_bytes;
+    }
     HANDLE job = CreateJobObjectW(NULL, NULL);
     if (!job ||
         !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
@@ -737,8 +766,15 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     ZeroMemory(&child, sizeof(child));
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
                   CREATE_NO_WINDOW;
-    BOOL created = CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, NULL, NULL,
+    /* Fail closed: a git child must never inherit a caller's GIT_DIR. */
+    wchar_t *env = process->strip_git_repo_env ? cbm_git_child_env_block() : NULL;
+    if (env) {
+        flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
+    BOOL created = (!process->strip_git_repo_env || env) &&
+                   CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
                                   &startup.StartupInfo, &child);
+    cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
     cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);
     free(wbin);
     free(wcmdline);
@@ -783,6 +819,17 @@ static bool cbm_win_job_active(cbm_subprocess_t *process, bool *known) {
     }
     *known = true;
     return accounting.ActiveProcesses != 0;
+}
+
+static void cbm_win_capture_job_memory(cbm_subprocess_t *process) {
+    process->result.job_memory_limit_bytes = process->memory_limit_bytes;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    ZeroMemory(&limits, sizeof(limits));
+    if (QueryInformationJobObject(process->job, JobObjectExtendedLimitInformation, &limits,
+                                  sizeof(limits), NULL)) {
+        process->result.peak_job_memory_bytes = (size_t)limits.PeakJobMemoryUsed;
+        process->result.job_memory_available = true;
+    }
 }
 
 static void cbm_win_begin_termination(cbm_subprocess_t *process, uint64_t now) {
@@ -873,9 +920,11 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
     if (process->force_started_ms != 0 &&
         now - process->force_started_ms >= CBM_SUBPROCESS_FORCE_SETTLE_MS &&
         (!job_known || job_active || !process->root_reaped)) {
+        cbm_win_capture_job_memory(process);
         return cbm_subprocess_finish_failed(process, out);
     }
     if (process->root_reaped && !job_active) {
+        cbm_win_capture_job_memory(process);
         return cbm_subprocess_finish(process, out);
     }
     return CBM_PROC_POLL_RUNNING;
@@ -970,7 +1019,7 @@ static void cbm_spawn_backoff(int attempt) {
     int shift = attempt < CBM_SPAWN_BACKOFF_MAX_SHIFT ? attempt : CBM_SPAWN_BACKOFF_MAX_SHIFT;
     long ms = (long)CBM_SPAWN_BACKOFF_BASE_MS << shift;
     struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000L * 1000L};
-    (void)cbm_nanosleep(&delay, NULL);
+    (void)cbm_nanosleep_full(&delay);
 }
 
 /* fork() fails with EAGAIN under the same pressure posix_spawn does, and the
@@ -1043,6 +1092,9 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     }
     for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
         (void)close(fd);
+    }
+    if (process->envp) {
+        environ = process->envp; /* execvp passes environ to the new image */
     }
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
@@ -1121,8 +1173,9 @@ static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int outpu
                       posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) == 0 &&
                       posix_spawn_file_actions_adddup2(&actions, output, STDERR_FILENO) == 0;
     pid_t pid = -1;
-    int rc =
-        configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv, environ) : -1;
+    int rc = configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv,
+                                       process->envp ? process->envp : environ)
+                        : -1;
     (void)posix_spawn_file_actions_destroy(&actions);
     (void)posix_spawnattr_destroy(&attr);
     if (configured && rc == 0 && pid > 0) {

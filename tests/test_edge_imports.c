@@ -241,6 +241,20 @@ static void ei_cleanup(EILangProj *lp, cbm_store_t *store) {
 
 /* Index `files`, check IMPORTS count >= `floor`.  Dumps a diagnostic on
  * failure so failures are self-diagnosable without re-running manually. */
+/* Exact-count variant of ei_edge_present: a fabricated EXTRA edge must fail
+ * the probe, so a floor is not enough (#1932's negative-assertion gap). */
+static int ei_edge_count_is(const EILangFile *files, int nfiles, const char *edge_type,
+                            int expected) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge_type) : -1;
+    if (got != expected) {
+        fprintf(stderr, "  [%s] FAIL count=%d expected==%d\n", edge_type, got, expected);
+    }
+    ei_cleanup(&lp, store);
+    return got == expected;
+}
+
 static int ei_edge_present(const EILangFile *files, int nfiles, const char *edge_type, int floor) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
@@ -348,6 +362,96 @@ TEST(ei_typescript_named_relative_import) {
         {"main.ts", "import { helper } from './util';\n\n"
                     "export function run(y: number): number { return helper(y); }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 2, "IMPORTS", 1));
+    PASS();
+}
+
+/* #1682: extensionless dotted basenames are part of the module name.  The
+ * resolver used to strip `.engine`, miss the module, and bind both imports to
+ * the same-named fixture Function in the sibling spec file. */
+TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682) {
+    static const char *engine_path = "packages/api/src/modules/featureX/featureX.engine.ts";
+    static const char *consumer_path = "packages/api/src/modules/consumer/consumer.service.ts";
+    static const EILangFile f[] = {
+        {"packages/api/src/modules/featureX/featureX.engine.ts",
+         "export interface SomeType { id: string; qty: number; }\n"
+         "export interface Evaluation { rateByItem: Record<string, number>; }\n"
+         "export function helperB(configs: SomeType[], lines: SomeType[]): Evaluation {\n"
+         "  return { rateByItem: { [lines[0].id]: lines[0].qty + configs.length } };\n"
+         "}\n"},
+        {"packages/api/src/modules/featureX/featureX.service.ts",
+         "import { SomeType, Evaluation, helperB } from './featureX.engine';\n"
+         "export class FeatureXService {\n"
+         "  evaluate(configs: SomeType[], lines: SomeType[]): Evaluation {\n"
+         "    return helperB(configs, lines);\n"
+         "  }\n"
+         "}\n"},
+        {"packages/api/src/modules/featureX/featureX.service.spec.ts",
+         "import { SomeType, helperB } from './featureX.engine';\n"
+         "function featureX(overrides: Partial<SomeType>): SomeType {\n"
+         "  return { id: 'x', qty: 1, ...overrides };\n"
+         "}\n"
+         "export function exerciseFixture(): number {\n"
+         "  return helperB([featureX({})], [featureX({ qty: 2 })]).rateByItem.x;\n"
+         "}\n"},
+        {"packages/api/src/modules/consumer/consumer.service.ts",
+         "import { helperB, type SomeType } from '../featureX/featureX.engine';\n"
+         "export class ConsumerService {\n"
+         "  callerMethod(items: SomeType[]): number {\n"
+         "    return helperB(items, [{ id: 'p1', qty: 1 }]).rateByItem.p1;\n"
+         "  }\n"
+         "}\n"},
+        {"packages/mobile/src/api.ts",
+         "export function helperB(token: string): Promise<unknown> {\n"
+         "  return fetch('/api/x', { method: 'POST', body: token });\n"
+         "}\n"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t consumer_id = ei_node_id_for_file_label(store, lp.project, consumer_path, "File");
+    ASSERT_GT(consumer_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, consumer_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+
+    bool saw_helper = false;
+    bool saw_type = false;
+    bool helper_target_ok = false;
+    bool type_target_ok = false;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        bool is_helper = strstr(props, "\"local_name\":\"helperB\"") != NULL;
+        bool is_type = strstr(props, "\"local_name\":\"SomeType\"") != NULL;
+        if (!is_helper && !is_type) {
+            continue;
+        }
+
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        bool target_ok = target->file_path && strcmp(target->file_path, engine_path) == 0;
+        if (is_helper) {
+            saw_helper = true;
+            helper_target_ok = target_ok;
+        }
+        if (is_type) {
+            saw_type = true;
+            type_target_ok = target_ok;
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+
+    ASSERT_TRUE(saw_helper);
+    ASSERT_TRUE(saw_type);
+    ASSERT_TRUE(helper_target_ok);
+    ASSERT_TRUE(type_target_ok);
     PASS();
 }
 
@@ -510,6 +614,141 @@ TEST(ei_go_two_consumers_same_package) {
         {"b/b.go", "package b\n\nimport \"example.com/two/util\"\n\n"
                    "func Run() int { return util.Helper(2) }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 4, "IMPORTS", 2));
+    PASS();
+}
+
+TEST(ei_go_import_never_binds_symbol) {
+    /* #1934: a Go import path names a package, never a symbol. `os/exec` is
+     * external (not in the graph), so the ONLY correct outcome is no edge —
+     * but Strategy 3's symbol-name fallback matched the path's last segment
+     * against any project definition named `exec` and bound the import to a
+     * test harness's method. Exact count: the internal `util` import (edge 1,
+     * via Strategy 1 → the package Folder) must be the whole IMPORTS
+     * relation; the fallback edge onto harness.exec (reproduce-first RED:
+     * count 2) must not exist. */
+    static const EILangFile f[] = {
+        {"go.mod", "module example.com/fxi\n\ngo 1.22\n"},
+        {"util/util.go", "package util\n\nfunc Tag() string { return \"t\" }\n"},
+        {"helper/harness.go", "package helper\n\ntype harness struct{ n int }\n\n"
+                              "func (h *harness) exec(cmd string) error { return nil }\n"},
+        /* Same-package decoy: the field-measured survivor bound os/exec to a
+         * method in the IMPORTER'S OWN package (Strategy 1b's sibling-file
+         * resolution accepts symbol labels too), so the fixture needs the
+         * collision both cross-package and same-package. */
+        {"app/aux.go", "package app\n\ntype runner struct{ n int }\n\n"
+                       "func (r *runner) exec(cmd string) error { return nil }\n"},
+        {"app/run.go", "package app\n\nimport (\n\t\"os/exec\"\n\n"
+                       "\t\"example.com/fxi/util\"\n)\n\n"
+                       "func Run() error {\n\t_ = util.Tag()\n"
+                       "\treturn exec.Command(\"true\").Run()\n}\n"}};
+    ASSERT_TRUE(ei_edge_count_is(f, 5, "IMPORTS", 1));
+    PASS();
+}
+
+/* #2127 helper: inbound edges of `edge_type` onto the (single) node named
+ * `name` with label `label`; -1 when that node is missing. */
+static int ei_inbound_edges_on(cbm_store_t *store, const char *project, const char *name,
+                               const char *label, const char *edge_type) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int64_t id = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0) {
+            id = nodes[i].id;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    if (id == 0) {
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_target_type(store, id, edge_type, &edges, &n) != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_free_edges(edges, n);
+    return n;
+}
+
+/* #2127: `from unittest.mock import patch` names an EXTERNAL module. Strategy
+ * 1 cannot resolve it, and Strategy 3's symbol-name fallback bound the import
+ * to the only project definition named `patch` — an unrelated REST view's
+ * HTTP handler — so every patch(...) call became an import_map CALLS edge at
+ * confidence 0.95 (and, once the import edge is gone, a unique_name edge; the
+ * member form `mock.patch(...)` a suffix_match edge). A Python import path
+ * names its module chain, so a symbol hit whose QN does not contain the chain
+ * of an EXTERNAL import is not the imported thing. The true project import
+ * (`from app.util import helper`) must keep both its IMPORTS and its CALLS
+ * edge. `pad` > MIN_FILES_FOR_PARALLEL(50) runs the
+ * same fixture through the parallel pipeline, so both drivers are covered. */
+static int ei_py_external_import_case(int pad) {
+    enum { EI_2127_BASE = 5, EI_2127_MAX = EI_2127_BASE + 64 };
+    static char names[EI_2127_MAX][32];
+    EILangFile f[EI_2127_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"app/views.py", "class PkgConfigView:\n"
+                                          "    def get(self, request):\n        return 1\n\n"
+                                          "    def patch(self, request):\n        return 2\n\n"
+                                          "    def copy(self):\n        return 3\n"};
+    f[n++] = (EILangFile){"app/util.py", "def helper():\n    return 1\n"};
+    /* Recall pin: a PROJECT module re-exporting a name defined elsewhere
+     * (`app.base` re-exports `app.errors.BoomError`) is an internal import;
+     * its weak resolution is never judged by the #2127 guard. */
+    f[n++] = (EILangFile){"app/errors.py", "class BoomError(Exception):\n    pass\n"};
+    f[n++] = (EILangFile){"app/base.py", "from app.errors import BoomError\n"};
+    f[n++] = (EILangFile){"tests/test_views.py", "import copy\n"
+                                                 "from unittest import mock\n"
+                                                 "from unittest.mock import patch\n"
+                                                 "from app.base import BoomError\n"
+                                                 "from app.util import helper\n\n\n"
+                                                 "def test_something():\n"
+                                                 "    mock.patch(\"app.views.other\")\n"
+                                                 "    copy.copy(helper)\n"
+                                                 "    if helper() > 1:\n"
+                                                 "        raise BoomError()\n"
+                                                 "    with patch(\"app.views.thing\"):\n"
+                                                 "        return helper()\n"};
+    for (int i = 0; i < pad && n < EI_2127_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int bad_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "patch", "Method", "IMPORTS") : -1;
+    int bad_calls = store ? ei_inbound_edges_on(store, lp.project, "patch", "Method", "CALLS") : -1;
+    /* `import copy` (a plain module import of stdlib `copy`) is no project
+     * method: neither the import nor `copy.copy(...)` may bind it. */
+    bad_imports += store ? ei_inbound_edges_on(store, lp.project, "copy", "Method", "IMPORTS") : 0;
+    bad_calls += store ? ei_inbound_edges_on(store, lp.project, "copy", "Method", "CALLS") : 0;
+    int good_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "helper", "Function", "IMPORTS") : -1;
+    int good_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "helper", "Function", "CALLS") : -1;
+    int reexport_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "BoomError", "Class", "CALLS") : -1;
+    int ok = bad_imports == 0 && bad_calls == 0 && good_imports >= 1 && good_calls >= 1 &&
+             reexport_calls >= 1;
+    if (!ok) {
+        fprintf(stderr,
+                "  [#2127 pad=%d] PkgConfigView.patch+copy IMPORTS=%d CALLS=%d (want 0/0); "
+                "helper IMPORTS=%d CALLS=%d (want >=1/>=1); BoomError CALLS=%d (want >=1)\n",
+                pad, bad_imports, bad_calls, good_imports, good_calls, reexport_calls);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_py_external_import_never_binds_project_symbol) {
+    /* Both legs run before asserting so a failure diagnoses both drivers. */
+    int sequential_ok = ei_py_external_import_case(0);
+    int parallel_ok = ei_py_external_import_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
     PASS();
 }
 
@@ -1021,6 +1260,7 @@ SUITE(edge_imports) {
 
     /* ── GREEN GUARDS — TypeScript (must stay passing) ── */
     RUN_TEST(ei_typescript_named_relative_import);
+    RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);
@@ -1037,6 +1277,8 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_subpackage_import);
     RUN_TEST(ei_go_blank_import);
     RUN_TEST(ei_go_two_consumers_same_package);
+    RUN_TEST(ei_go_import_never_binds_symbol);
+    RUN_TEST(ei_py_external_import_never_binds_project_symbol);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */

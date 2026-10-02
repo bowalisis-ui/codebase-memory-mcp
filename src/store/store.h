@@ -28,6 +28,10 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
 
+#define CBM_STORE_FILE_OUTLINE_MAX_LIMIT 200
+#define CBM_STORE_FILE_OUTLINE_MAX_LABELS 16
+#define CBM_STORE_FILE_OUTLINE_MAX_TEXT_BYTES (256U * 1024U)
+
 /* ── Data structures ────────────────────────────────────────────── */
 
 typedef struct {
@@ -41,6 +45,18 @@ typedef struct {
     int end_line;
     const char *properties_json; /* JSON string, NULL → "{}" */
 } cbm_node_t;
+
+/* Compact declaration row returned by the bounded file-outline query. */
+typedef struct {
+    const char *name;
+    const char *label;
+    const char *qualified_name;
+    int start_line;
+    int end_line;
+} cbm_file_outline_row_t;
+
+/* Optional cancellation callback for bounded store queries. */
+typedef bool (*cbm_store_cancel_fn)(void *context);
 
 typedef struct {
     int64_t id;
@@ -92,8 +108,8 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 
-/* Get distinct file paths for a project. Caller must free each out[i] and out itself.
- * Returns CBM_STORE_OK or CBM_STORE_ERR. */
+/* Get distinct canonical File-node paths, with a non-Folder node fallback for legacy/manual
+ * stores that have no File nodes. Caller frees each out[i] and out itself. */
 int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count);
 
 /* Persisted index-format identity. Bump when a change alters the QN scheme
@@ -222,8 +238,10 @@ typedef struct {
     int visited_count;
     cbm_edge_info_t *edges;
     int edge_count;
-    /* True when trail expansion hit its recursive-row safety budget. */
+    /* True when trail expansion hit its recursive-row safety budget (or, for
+     * the plain BFS, the max_results ceiling); counts are lower bounds. */
     bool truncated;
+    bool edges_truncated; /* optional edge-data ceiling reached; node counts stay exact */
 } cbm_traverse_result_t;
 
 /* ── Schema introspection ───────────────────────────────────────── */
@@ -353,6 +371,11 @@ const char *cbm_store_db_path(const cbm_store_t *s);
  * (projects table has correct types, no corruption indicators).
  * Returns false if corruption is detected — caller should delete and re-index. */
 bool cbm_store_check_integrity(cbm_store_t *s);
+/* True when the edges table carries the #768 local_name_gen discriminator —
+ * the schema a read-write open (cbm_store_open_path_existing) requires. A
+ * pre-#768 store still serves read-only queries but refuses every write open
+ * until it is reindexed. Read-only: safe on a store opened for query. */
+bool cbm_store_edges_schema_current(cbm_store_t *s);
 /* Shallow check + PRAGMA quick_check — catches page-level corruption.
  * O(db size); use on rare paths (artifact import), not hot opens. */
 bool cbm_store_check_integrity_deep(cbm_store_t *s);
@@ -426,9 +449,17 @@ int cbm_store_checkpoint(cbm_store_t *s);
  * connection, in bytes; -1 = unlimited (SQLite default / pre-fix). */
 int64_t cbm_store_journal_size_limit(cbm_store_t *s);
 
+/* Advance the pagination-cursor generation atomically. Seeds a genuinely
+ * legacy database with a fresh per-file uid, preserves that uid thereafter,
+ * and increments its canonical uint64 mutation counter. Safe inside an
+ * existing transaction (implemented with a nested savepoint); malformed or
+ * partial metadata fails closed without committing a partial advance. */
+int cbm_store_generation_advance(cbm_store_t *s);
+
 /* Opaque store generation for pagination-cursor staleness detection:
- * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
- * bumps on every index run. "legacy" for DBs predating store_meta. */
+ * "u<16-lower-hex-db_uid>g<canonical-uint64-mutation_gen>". Returns "legacy"
+ * only when store_meta is genuinely absent; malformed or missing metadata is
+ * an error. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
 
 /* Seal a fully-written staging database before atomic publication.
@@ -496,6 +527,18 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
+
+/* Return a stable, paginated outline for one exact repository-relative file.
+ * File/folder/container nodes are excluded. labels may be NULL when
+ * label_count is zero; otherwise labels are exact-match filters. The query is
+ * capped by CBM_STORE_FILE_OUTLINE_MAX_LIMIT and a fixed aggregate text-byte
+ * budget, and fails without partial rows when cancelled or over budget.
+ * total is the exact filtered count before pagination. */
+int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *file_path,
+                               const char *const *labels, int label_count, int limit, int offset,
+                               cbm_store_cancel_fn cancel, void *cancel_context,
+                               cbm_file_outline_row_t **out, int *count, int *total);
+void cbm_store_free_file_outline(cbm_file_outline_row_t *rows, int count);
 
 /* Batch lookup: map qualified names → node IDs.
  * qns[i] is resolved; out_ids[i] receives the ID or 0 if not found.
@@ -682,6 +725,13 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
 int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
                         const char **edge_types, int edge_type_count, int max_depth,
                         int max_results, cbm_traverse_result_t *out);
+/* BFS with an explicit edge-data budget. max_edges=0 skips the secondary
+ * all-pairs edge lookup; max_edges>0 collects at most that many edges and
+ * raises out->edges_truncated on saturation. Node traversal is unchanged.
+ * This is intended for lean callers that need nodes but not edge properties. */
+int cbm_store_bfs_with_edge_limit(cbm_store_t *s, int64_t start_id, const char *direction,
+                                  const char **edge_types, int edge_type_count, int max_depth,
+                                  int max_results, int max_edges, cbm_traverse_result_t *out);
 
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
@@ -1003,7 +1053,11 @@ typedef struct {
 /* Search for nodes similar to the given query keywords using stored RI vectors.
  * Builds a merged query vector from the keywords, then does cosine scan via
  * the cbm_cosine_i8 SQL function joined with the nodes table.
- * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+ * Returns CBM_STORE_OK with results sorted by score DESC (possibly zero),
+ * CBM_STORE_NOT_FOUND when the store carries no node_vectors table (lean
+ * index — an empty universe, not a fault), or CBM_STORE_ERR when the scan
+ * itself failed; callers must not render CBM_STORE_ERR as zero matches.
+ * Caller must free with cbm_store_free_vector_results. */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count);

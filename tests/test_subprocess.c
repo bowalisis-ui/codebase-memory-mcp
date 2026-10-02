@@ -12,18 +12,24 @@
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/git_env.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <windows.h>
+#include "../src/foundation/win_utf8.h"
 #endif
 
 /* ── Layer 1: pure classifier (all platforms) ─────────────────────────────── */
@@ -194,6 +200,52 @@ TEST(subprocess_retries_transient_spawn_refusal) {
 #endif
 }
 
+#ifndef _WIN32
+static volatile sig_atomic_t g_spawn_backoff_alarm_count = 0;
+
+static void spawn_backoff_alarm_handler(int signal_number) {
+    (void)signal_number;
+    g_spawn_backoff_alarm_count++;
+}
+#endif
+
+TEST(subprocess_spawn_backoff_resumes_after_eintr) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX signal interruption");
+#else
+    struct sigaction action = {0};
+    struct sigaction previous_action = {0};
+    action.sa_handler = spawn_backoff_alarm_handler;
+    (void)sigemptyset(&action.sa_mask);
+    bool handler_installed = sigaction(SIGALRM, &action, &previous_action) == 0;
+
+    struct itimerval timer = {
+        .it_interval = {.tv_sec = 0, .tv_usec = 1000},
+        .it_value = {.tv_sec = 0, .tv_usec = 1000},
+    };
+    g_spawn_backoff_alarm_count = 0;
+    bool timer_started = handler_installed && setitimer(ITIMER_REAL, &timer, NULL) == 0;
+
+    uint64_t started_at = cbm_now_ms();
+    cbm_subprocess_force_spawn_eagain_for_testing(3);
+    cbm_proc_result_t result = run_sh("exit 0", 0);
+    uint64_t elapsed_ms = cbm_now_ms() - started_at;
+
+    struct itimerval disabled = {0};
+    (void)setitimer(ITIMER_REAL, &disabled, NULL);
+    if (handler_installed) {
+        (void)sigaction(SIGALRM, &previous_action, NULL);
+    }
+
+    ASSERT_TRUE(handler_installed);
+    ASSERT_TRUE(timer_started);
+    ASSERT_TRUE(g_spawn_backoff_alarm_count > 0);
+    ASSERT_TRUE(elapsed_ms >= 50);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    PASS();
+#endif
+}
+
 TEST(subprocess_gives_up_after_the_retry_budget) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX fork/EAGAIN path");
@@ -232,10 +284,20 @@ TEST(subprocess_run_spawn_failure) {
 TEST(subprocess_run_null_bin_rejected) {
     cbm_proc_opts_t opts = {0};
     opts.bin = NULL;
-    cbm_proc_result_t r;
+    /* Reusing a previous result must not expose stale Job Object diagnostics
+     * when validation rejects the next spawn before a process exists. */
+    cbm_proc_result_t r = {
+        .job_memory_limit_bytes = 123,
+        .peak_job_memory_bytes = 456,
+        .job_memory_available = true,
+    };
     int rc = cbm_subprocess_run(&opts, &r);
     ASSERT_EQ(rc, -1);
     ASSERT_EQ(r.outcome, CBM_PROC_SPAWN_FAILED);
+    ASSERT_EQ(r.exit_code, -1);
+    ASSERT_TRUE(r.job_memory_limit_bytes == 0);
+    ASSERT_TRUE(r.peak_job_memory_bytes == 0);
+    ASSERT_FALSE(r.job_memory_available);
     PASS();
 }
 
@@ -693,6 +755,46 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
     ASSERT_FALSE(result.supervision_failed);
     ASSERT_TRUE(root_gone);
     ASSERT_TRUE(grandchild_gone);
+    PASS();
+#endif
+}
+
+TEST(subprocess_windows_job_object_enforces_memory_limit) {
+#ifndef _WIN32
+    SKIP_PLATFORM("native Windows Job Object memory-limit probe");
+#else
+    char *self_path = cbm_module_path_utf8();
+    ASSERT_TRUE(self_path != NULL);
+    const char *argv[] = {self_path, "__cbm_windows_memory_limit_probe", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = self_path;
+    opts.argv = argv;
+    opts.quiet_timeout_ms = 5000;
+
+    /* Without the cap the SAME allocation must succeed. A machine-wide commit
+     * shortage must fail this test, not masquerade as Job Object enforcement. */
+    cbm_proc_result_t uncapped = {0};
+    int uncapped_rc = cbm_subprocess_run(&opts, &uncapped);
+    opts.memory_limit_bytes = (size_t)1024U * 1024U * 1024U;
+    cbm_proc_result_t result = {0};
+    int run_rc = cbm_subprocess_run(&opts, &result);
+    free(self_path);
+    ASSERT_EQ(uncapped_rc, 0);
+    ASSERT_EQ(uncapped.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(uncapped.exit_code, 0);
+    ASSERT_TRUE(uncapped.tree_quiesced);
+    ASSERT_FALSE(uncapped.supervision_failed);
+    ASSERT_TRUE(uncapped.job_memory_limit_bytes == 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_EXIT_NONZERO);
+    ASSERT_EQ(result.exit_code, 73);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(result.job_memory_available);
+    ASSERT_TRUE(result.job_memory_limit_bytes == opts.memory_limit_bytes);
+    ASSERT_TRUE(result.peak_job_memory_bytes > 0);
+    /* Windows may include the denied reservation in its peak counter, so peak
+     * can exceed the cap. The uncapped/capped exit codes prove enforcement. */
     PASS();
 #endif
 }
@@ -1158,6 +1260,114 @@ TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths) {
     PASS();
 }
 
+/* ── Git child environment (#2003) ────────────────────────────────────────────
+ * strip_git_repo_env / cbm_popen_git drop every variable of
+ * `git rev-parse --local-env-vars` from the CHILD only: the parent keeps its
+ * environment, other variables pass through, and without the flag a child
+ * still inherits everything. The test sets the variables itself (a runner may
+ * clear them at startup) and restores them before asserting. */
+#ifndef _WIN32
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} gitenv_snapshot_t;
+
+static void gitenv_enter(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+        setenv(cbm_git_repo_env_vars[i], "/cbm-decoy-repo", 1);
+    }
+    setenv("CBM_GITENV_KEEP", "kept", 1);
+}
+
+static void gitenv_leave(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+    }
+    unsetenv("CBM_GITENV_KEEP");
+}
+
+/* exit 0: no git repo-local var is set and CBM_GITENV_KEEP=kept; exit 3: a git
+ * var leaked; exit 4: the unrelated variable was lost. */
+static void gitenv_probe_script(char *buf, size_t cap) {
+    size_t n = (size_t)snprintf(buf, cap, "[ \"$CBM_GITENV_KEEP\" = kept ] || exit 4;");
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT && n < cap; i++) {
+        n += (size_t)snprintf(buf + n, cap - n, " [ -z \"${%s+x}\" ] || exit 3;",
+                              cbm_git_repo_env_vars[i]);
+    }
+    if (n < cap) {
+        (void)snprintf(buf + n, cap - n, " exit 0");
+    }
+}
+
+static int gitenv_spawn_probe(bool strip) {
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    cbm_proc_opts_t opts = {.bin = "/bin/sh", .argv = argv, .strip_git_repo_env = strip};
+    cbm_proc_result_t r;
+    if (cbm_subprocess_run(&opts, &r) != 0) {
+        return -1;
+    }
+    return r.exit_code;
+}
+#endif
+
+TEST(subprocess_strip_git_repo_env_is_per_child) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    int stripped = gitenv_spawn_probe(true);
+    int inherited = gitenv_spawn_probe(false);
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_EQ(stripped, 0);   /* git vars gone, CBM_GITENV_KEEP passed through */
+    ASSERT_EQ(inherited, 3);  /* without the flag the child inherits as before */
+    ASSERT_TRUE(parent_kept); /* the parent environment is never modified */
+    PASS();
+#endif
+}
+
+TEST(popen_git_strips_repo_env_and_reports_exit_status) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    char cmd[2200];
+    snprintf(cmd, sizeof(cmd), "echo probe; %s", script);
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    FILE *fp = cbm_popen_git(cmd);
+    char line[64] = {0};
+    bool got_line = fp && fgets(line, sizeof(line), fp) != NULL;
+    int status = fp ? cbm_pclose(fp) : -1;
+    FILE *fail = cbm_popen_git("exit 7");
+    int fail_status = fail ? cbm_pclose(fail) : -1;
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_TRUE(got_line);
+    ASSERT_STR_EQ(line, "probe\n");
+    ASSERT_TRUE(status >= 0 && WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(fail_status >= 0 && WIFEXITED(fail_status));
+    ASSERT_EQ(WEXITSTATUS(fail_status), 7); /* pclose() semantics: raw wait status */
+    ASSERT_TRUE(parent_kept);
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -1172,6 +1382,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
     RUN_TEST(subprocess_retries_transient_spawn_refusal);
+    RUN_TEST(subprocess_spawn_backoff_resumes_after_eintr);
     RUN_TEST(subprocess_gives_up_after_the_retry_budget);
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
@@ -1180,11 +1391,14 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree);
+    RUN_TEST(subprocess_windows_job_object_enforces_memory_limit);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
+    RUN_TEST(subprocess_strip_git_repo_env_is_per_child);
+    RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);

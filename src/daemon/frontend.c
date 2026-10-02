@@ -40,6 +40,19 @@ enum {
      * cancelled and the frontend exits cleanly. */
     FRONTEND_EOF_DRAIN_MS = 15000,
     FRONTEND_MAINTENANCE_POLL_MS = 10,
+    /* Cadence for the quiet no-maintenance steady state. Every presence probe
+     * try-acquires the maintenance marker lock, and on Windows that
+     * revalidates the whole ancestor directory chain (a CreateFileW +
+     * identity check per path component). At the old 10 ms cadence this
+     * burned ~20% of a core for the life of every MCP session — 7762
+     * CPU-seconds on one 9.5 h session in the 2026-08-29 incident. The
+     * budget: an activation drains participants within
+     * CLI_ACTIVATION_DRAIN_TIMEOUT_MS (15 s) and the monitor's own exit grace
+     * is FRONTEND_MAINTENANCE_GRACE_MS (3 s), so a 250 ms detection latency
+     * spends under 2% of that window while cutting the probe cost 25-fold.
+     * The 10 ms cadence still paces the monitor's post-detection grace loop,
+     * which does no lock probing. */
+    FRONTEND_MAINTENANCE_IDLE_POLL_MS = 250,
     /* The owner thread may be draining a supervised process tree. Preserve the
      * supervisor's complete graceful + forced-settle window before the monitor
      * fail-stops the process, plus scheduling/teardown margin. */
@@ -162,7 +175,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
         cbm_version_cohort_maintenance_presence_t presence =
             frontend_observe_maintenance(monitor->manager, true);
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
-            cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
+            cbm_usleep(FRONTEND_MAINTENANCE_IDLE_POLL_MS * 1000U);
             continue;
         }
 
@@ -369,8 +382,26 @@ static bool frontend_write_response(FILE *out, const uint8_t *response, uint32_t
     return fflush(out) == 0 && written;
 }
 
+const char *cbm_daemon_frontend_cancelled_error_message(const char *request_message) {
+    static const char plain[] = "Request cancelled";
+    static const char index_call[] = "Request cancelled. " CBM_MCP_INDEX_ASYNC_HINT;
+    cbm_jsonrpc_request_t request = {0};
+    if (!request_message || cbm_jsonrpc_parse(request_message, &request) != 0) {
+        return plain;
+    }
+    char *tool = request.method && strcmp(request.method, "tools/call") == 0 && request.params_raw
+                     ? cbm_mcp_get_string_arg(request.params_raw, "name")
+                     : NULL;
+    bool index_repository = tool && strcmp(tool, "index_repository") == 0;
+    safe_free(tool);
+    cbm_jsonrpc_request_free(&request);
+    return index_repository ? index_call : plain;
+}
+
 static bool frontend_write_cancelled_response(FILE *out, const frontend_item_t *item) {
-    static const char cancelled_error[] = "{\"code\":-32800,\"message\":\"Request cancelled\"}";
+    char cancelled_error[512];
+    (void)snprintf(cancelled_error, sizeof(cancelled_error), "{\"code\":-32800,\"message\":\"%s\"}",
+                   cbm_daemon_frontend_cancelled_error_message(item->message));
     cbm_jsonrpc_response_t response = {
         .id = item->id,
         .id_str = item->id_str,
